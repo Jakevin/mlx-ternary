@@ -96,7 +96,7 @@ MLX affine 2-bit stores the same codes, 16 per uint32, lane `i` in bits `[2i, 2i
 
 * Batch 1, or any batch whose size, row count, or `K` is not a multiple of 32: simdgroup GEMV. `K` multiple of 512 uses two output rows per simdgroup and 16 weights per lane. Other `K`, including 640, uses a 4-wide dot plus a scalar tail.
 * Batch ≥ 32 with batch, rows, and `K` all multiples of 32: 32×32×32 simdgroup-matrix GEMM. Weights are staged as half in the threadgroup; the accumulator stays float. The 32-wide K tile never crosses a scale group of 64.
-* The Metal graph is compiled once per weight buffer and batch.
+* Batches up to 8 use a bounded LRU of compiled graphs keyed by shape (no weight references held); larger batches dispatch directly.
 
 ## Limits
 

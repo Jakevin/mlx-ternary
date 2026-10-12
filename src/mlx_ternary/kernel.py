@@ -13,7 +13,9 @@ including 640, uses a 4-wide dot. Batch >= 32 with the batch, the row count,
 and K all divisible by 32 uses a 32x32x32 simdgroup-matrix GEMM. The weight
 tile is half, the accumulator is float, and a tile never crosses a scale group.
 
-The graph is compiled once per weight buffer and batch.
+Batches up to 8 run through a small LRU of compiled graphs keyed by shape.
+Weights are passed as arguments, so the cache holds no weight arrays.
+Larger batches dispatch directly.
 """
 from __future__ import annotations
 
@@ -682,7 +684,28 @@ def run_gemm(x, codes, scales, k, bm: int = GEMM_BM, bn: int = GEMM_BN, bk: int 
     return y
 
 
-_COMPILED: dict = {}
+from collections import OrderedDict
+
+COMPILE_MAX_BATCH = 8
+COMPILE_CACHE_SIZE = 64
+_COMPILED: OrderedDict = OrderedDict()
+
+
+def _compiled(k: int, n: int, b: int, group: int, x_dtype, c_dtype, s_dtype):
+    key = (k, n, b, group, x_dtype, c_dtype, s_dtype)
+    fn = _COMPILED.get(key)
+    if fn is not None:
+        _COMPILED.move_to_end(key)
+        return fn
+
+    def _run(z, c, s):
+        return _dispatch(z, c, s, k, group)
+
+    fn = mx.compile(_run)
+    _COMPILED[key] = fn
+    while len(_COMPILED) > COMPILE_CACHE_SIZE:
+        _COMPILED.popitem(last=False)
+    return fn
 
 
 def _dispatch(x, codes, scales, k: int, group: int):
@@ -711,9 +734,10 @@ def _gemm_launch(b: int, n: int, k: int) -> tuple[int, int, int] | None:
 def tern_matmul(x, codes, scales, k: int, group: int = GROUP) -> mx.array:
     """x [B, K] or [K], codes uint8 [N, K/4], scales [N, K/group] -> [B, N].
 
-    The Metal graph is compiled once per weight buffer and batch. Steady-state
-    calls skip rebuilding it. Warmup pays the compile. A vector input comes
-    back as shape [1, N].
+    Batches up to ``COMPILE_MAX_BATCH`` reuse a compiled graph from a bounded
+    LRU keyed by shape and dtype; weights are arguments, not captured, so the
+    cache never keeps them alive. Larger batches dispatch the kernel directly.
+    A vector input comes back as shape [1, N].
     """
     if not isinstance(x, mx.array):
         x = mx.array(x)
@@ -735,14 +759,7 @@ def tern_matmul(x, codes, scales, k: int, group: int = GROUP) -> mx.array:
     if b == 0 or n == 0:
         # An empty launch would hand Metal a zero-size buffer.
         return mx.zeros((b, n), dtype=mx.float32)
-    key = (id(codes), id(scales), int(k), b, n, int(group))
-    fn = _COMPILED.get(key)
-    if fn is None:
-        captured = (codes, scales, int(k), int(group))
-
-        def _run(z):
-            return _dispatch(z, captured[0], captured[1], captured[2], captured[3])
-
-        fn = mx.compile(_run)
-        _COMPILED[key] = fn
-    return fn(x)
+    if b > COMPILE_MAX_BATCH:
+        return _dispatch(x, codes, scales, k, int(group))
+    fn = _compiled(k, n, b, int(group), x.dtype, codes.dtype, scales.dtype)
+    return fn(x, codes, scales)
