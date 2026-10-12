@@ -14,18 +14,22 @@ import numpy as np
 
 from .convert import from_mlx_2bit
 from .kernel import tern_matmul
-from .pack import GROUP, pack_trits
+from .pack import GROUP, GROUPS, pack_trits
 
 
 class TernaryLinear(nn.Module):
     """Packed ternary affine layer.
 
     ``weight`` is uint8 ``[output_dims, input_dims / 4]``. ``scales`` is
-    float32 ``[output_dims, input_dims / 64]``. Parameters are frozen.
+    float32 ``[output_dims, input_dims / group_size]``. ``group_size`` is 64
+    (default) or 128. Parameters are frozen.
     """
 
-    def __init__(self, weight, scales, bias=None):
+    def __init__(self, weight, scales, bias=None, group_size: int = GROUP):
         super().__init__()
+        group_size = int(group_size)
+        if group_size not in GROUPS:
+            raise ValueError(f"group_size {group_size} not in {GROUPS}")
         if not isinstance(weight, mx.array):
             weight = mx.array(np.ascontiguousarray(weight))
         if weight.dtype != mx.uint8:
@@ -40,15 +44,16 @@ class TernaryLinear(nn.Module):
             raise ValueError("weight and scales must be matrices")
         n, row_bytes = (int(v) for v in weight.shape)
         k = row_bytes * 4
-        if k % GROUP or scales.shape != (n, k // GROUP):
+        if k % group_size or scales.shape != (n, k // group_size):
             raise ValueError(
                 f"weight {tuple(weight.shape)} and scales {tuple(scales.shape)} "
-                f"are not a group-{GROUP} ternary matrix"
+                f"are not a group-{group_size} ternary matrix"
             )
         self.weight = weight
         self.scales = scales
         self.input_dims = k
         self.output_dims = n
+        self.group_size = group_size
         if bias is not None:
             if not isinstance(bias, mx.array):
                 bias = mx.array(bias)
@@ -60,7 +65,7 @@ class TernaryLinear(nn.Module):
     def _extra_repr(self) -> str:
         return (
             f"input_dims={self.input_dims}, output_dims={self.output_dims}, "
-            f"bias={'bias' in self}, group_size={GROUP}, bits=2"
+            f"bias={'bias' in self}, group_size={self.group_size}, bits=2"
         )
 
     def __call__(self, x):
@@ -68,7 +73,7 @@ class TernaryLinear(nn.Module):
             raise ValueError(f"x last dim {x.shape[-1]} != input_dims {self.input_dims}")
         lead = x.shape[:-1]
         flat = x.reshape(-1, self.input_dims)
-        y = tern_matmul(flat, self.weight, self.scales, self.input_dims)
+        y = tern_matmul(flat, self.weight, self.scales, self.input_dims, self.group_size)
         if y.dtype != x.dtype:
             y = y.astype(x.dtype)
         if "bias" in self:
@@ -79,31 +84,33 @@ class TernaryLinear(nn.Module):
         return y.reshape(*lead, self.output_dims)
 
     @classmethod
-    def from_trits(cls, trits, scales, bias=None) -> "TernaryLinear":
+    def from_trits(cls, trits, scales, bias=None, group_size: int = GROUP) -> "TernaryLinear":
         """Build from int8 trits ``{-1,0,1}`` of shape ``[output, input]``."""
         packed, _row = pack_trits(np.asarray(trits))
-        return cls(packed, scales, bias)
+        return cls(packed, scales, bias, group_size)
 
     @classmethod
-    def from_mlx_2bit(cls, weight, scales, biases, bias=None) -> "TernaryLinear":
+    def from_mlx_2bit(cls, weight, scales, biases, bias=None, group_size: int = GROUP) -> "TernaryLinear":
         """Build from MLX affine 2-bit ternary tensors."""
-        packed, scale_f = from_mlx_2bit(weight, scales, biases)
-        return cls(packed, scale_f, bias)
+        packed, scale_f = from_mlx_2bit(weight, scales, biases, group_size)
+        return cls(packed, scale_f, bias, group_size)
 
     @classmethod
     def from_quantized_linear(cls, layer: nn.Module) -> "TernaryLinear":
         """Replace one affine 2-bit ``QuantizedLinear`` that stores ternary weights."""
         if not isinstance(layer, nn.QuantizedLinear):
             raise TypeError(f"expected QuantizedLinear, got {type(layer).__name__}")
-        if layer.bits != 2 or layer.group_size != GROUP or layer.mode != "affine":
+        if layer.bits != 2 or layer.group_size not in GROUPS or layer.mode != "affine":
             raise ValueError(
-                f"expected affine 2-bit group {GROUP}, got bits={layer.bits} "
+                f"expected affine 2-bit group {GROUPS}, got bits={layer.bits} "
                 f"group_size={layer.group_size} mode={layer.mode}"
             )
         if layer.biases is None:
             raise ValueError("affine 2-bit ternary storage needs biases equal to -scales")
         extra = layer.bias if "bias" in layer else None
-        return cls.from_mlx_2bit(layer.weight, layer.scales, layer.biases, bias=extra)
+        return cls.from_mlx_2bit(
+            layer.weight, layer.scales, layer.biases, bias=extra, group_size=layer.group_size
+        )
 
 
 def _replace_linear(value, path: str):

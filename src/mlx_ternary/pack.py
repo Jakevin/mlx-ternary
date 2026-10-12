@@ -3,7 +3,7 @@
 """2-bit ternary pack format.
 
 Four codes share a byte, low bits first. The stored code is ``trit + 1``
-in {0, 1, 2}. One scale covers 64 weights and there is no zero point:
+in {0, 1, 2}. One scale covers 64 weights (128 as an option) and there is no zero point:
 
     weight = (code - 1) * scale
 """
@@ -14,6 +14,8 @@ import math
 import numpy as np
 
 GROUP = 64
+# Supported group sizes. 128 halves the scale overhead (2.125 bits stored).
+GROUPS = (64, 128)
 
 
 def info_bits_per_weight(group_size: int = GROUP) -> float:

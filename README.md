@@ -24,6 +24,12 @@ A ternary value carries log2(3) ≈ 1.585 bits, plus one 16-bit scale for every 
 
 Ternary currently occupies 2.25 bits per weight resident, the same as MLX 2-bit. The point is an extra supported format with no speed loss, not smaller files.
 
+## Group size 128 (option)
+
+The default is one scale per 64 weights. Pass `group_size=128` to `TernaryLinear`, `from_mlx_2bit` and `from_trits`, or `group=128` to `tern_matmul`; `from_quantized_linear` picks it up from the layer. One scale per 128 weights stores 2 + 16/128 = 2.125 bits per weight. The codes are the same; only `scales` changes to `[N, K/128]`, and `K` must be a multiple of 128.
+
+On d3-nano (150-question eval, argmax agreement with bf16, mean KL), the shipped model, whose one ternary unit is layer 19 `mlp.down_proj`, gives KL 0.0522 at both group 64 and group 128. A stress test with every 2-bit unit made ternary (197M ternary parameters) gives KL 0.0729 at group 64 and 0.0785 at group 128, about 8% worse; agreement is 136/150 for both. Batch 1 speed is the same as group 64; batch 128 GEMM was 1-20% slower on the timed shapes.
+
 The reference is the dequantized ternary matrix, `max|y − ref| / max|ref|`. The bound is 1e-3. The largest probed case was 1.44e-6 (64×6144, batch 32). Errors on the timed shapes were at most 4e-7. Those probes used scales that are exact in half precision. The batch ≥ 32 GEMM stages dequantized weights as half, so with arbitrary float32 scales its error is set by half rounding of `scale` (seen up to about 3e-4, still under 1e-3); the GEMV path stays near 1e-7.
 
 ## Load a layer
@@ -88,22 +94,22 @@ Codes are int8 `{-1, 0, +1}`, stored as `{0, 1, 2}`. Four codes fill one uint8, 
 | 4–5 | 4t+2 |
 | 6–7 | 4t+3 |
 
-`weight` has shape `[output, K/4]` uint8. `scales` has shape `[output, K/64]`. `K` is a multiple of 64. The value is `(code - 1) * scale`. Code 3 is rejected.
+`weight` has shape `[output, K/4]` uint8. `scales` has shape `[output, K/64]` (or `[output, K/128]` with the group 128 option). `K` is a multiple of the group size. The value is `(code - 1) * scale`. Code 3 is rejected.
 
 MLX affine 2-bit stores the same codes, 16 per uint32, lane `i` in bits `[2i, 2i+2)`, with a scale and a bias per group. Ternary checkpoints use bias = `-scale`. `from_mlx_2bit` checks that and returns the byte layout above. On this machine the uint32 bytes and the 4-per-byte layout are the same little-endian sequence.
 
 ## What the kernels do
 
-* Batch 1, or any batch whose size, row count, or `K` is not a multiple of 32: simdgroup GEMV. `K` multiple of 512 uses two output rows per simdgroup and 16 weights per lane. Other `K`, including 640, uses a 4-wide dot plus a scalar tail.
-* Batch ≥ 32 with batch, rows, and `K` all multiples of 32: 32×32×32 simdgroup-matrix GEMM. Weights are staged as half in the threadgroup; the accumulator stays float. The 32-wide K tile never crosses a scale group of 64.
+* Batch below 32, or a row count or `K` that is not a multiple of 32: simdgroup GEMV. `K` multiple of 512 uses two output rows per simdgroup and 16 weights per lane. Other `K`, including 640, uses a 4-wide dot plus a scalar tail.
+* Batch ≥ 32 with rows and `K` multiples of 32: 32×32×32 simdgroup-matrix GEMM. Weights are staged as half in the threadgroup; the accumulator stays float. The 32-wide K tile never crosses a scale group. If the batch is not a multiple of 32, the leading multiple of 32 goes through the GEMM and the remaining rows through the GEMV (batch 100 on 6144×2048: 0.63 ms, was 2.67 ms all-GEMV).
 * Batches up to 8 use a bounded LRU of compiled graphs keyed by shape (no weight references held); larger batches dispatch directly.
 
 ## Limits
 
 * Apple Silicon, through MLX Metal.
-* Group size is 64. `K` is a multiple of 64. There is no per-group zero point.
+* Group size is 64 (default) or 128. `K` is a multiple of the group size. There is no per-group zero point.
 * The layer returns the dtype of `x`. The kernel accumulates in float32.
-* Inputs may be non-contiguous views; they are copied to row-major first. An empty batch returns an empty result without a kernel launch. `tern_matmul` checks that `codes` is `[N, K/4]` and `scales` is `[N, K/64]`.
+* Inputs may be non-contiguous views; they are copied to row-major first. An empty batch returns an empty result without a kernel launch. `tern_matmul` checks that `codes` is `[N, K/4]` and `scales` is `[N, K/group]`.
 * Parameters are frozen. This package does not choose scales or codes.
 * `from_quantized_linear` accepts an affine 2-bit `QuantizedLinear` whose codes are in {0, 1, 2} and whose per-group bias equals `-scale`. Other bit widths and other biases raise `ValueError`.
 * The 1e-3 figure is the kernel's error against the packed ternary matrix.

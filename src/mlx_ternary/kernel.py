@@ -3,14 +3,15 @@
 """Ternary GEMV and GEMM for MLX.
 
 Codes {-1,0,1} are stored as 2-bit values {0,1,2}, four per byte, low bits
-first. One scale per 64 weights and no zero point: value = (code - 1) * scale.
+first. One scale per 64 weights (or 128, as an option) and no zero point: value = (code - 1) * scale.
 The inner loop is the MLX 2-bit mask dot: pre-scale x by 1, 1/4, 1/16, 1/64
 and AND the byte.
 
 Small batches use a simdgroup GEMV. K multiple of 512 follows the MLX
 qmv_fast walk (two rows per simdgroup, 16 weights per lane). Other K,
-including 640, uses a 4-wide dot. Batch >= 32 with the batch, the row count,
-and K all divisible by 32 uses a 32x32x32 simdgroup-matrix GEMM. The weight
+including 640, uses a 4-wide dot. Batch >= 32 with the row count and K
+divisible by 32 uses a 32x32x32 simdgroup-matrix GEMM; if the batch is not a
+multiple of 32, the leftover rows go through the GEMV. The weight
 tile is half, the accumulator is float, and a tile never crosses a scale group.
 
 Batches up to 8 run through a small LRU of compiled graphs keyed by shape.
@@ -21,9 +22,7 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-from .pack import GROUP
-
-CACHE_LIMIT = 2 * 1024**3
+from .pack import GROUP, GROUPS
 
 
 def set_cache_limit(gb: float = 2) -> int:
@@ -65,10 +64,10 @@ using namespace metal;
 """
 
 
-def metal(name: str, source: str, header: str = _HEADER, fast: bool = True):
+def metal(name: str, source: str, header: str = _HEADER):
     # MLX 0.22 metal_kernel has no compile_options. The cache key does not
     # include the source, so a body change must use a new name.
-    key = (name, fast, header[:40])
+    key = (name, header[:40])
     if key not in _KERNELS:
         _KERNELS[key] = mx.fast.metal_kernel(
             name=name,
@@ -92,10 +91,10 @@ def meta_u32(values: list[int]) -> mx.array:
 
 
 def _prepare(x, codes, scales, k, group):
-    if group != GROUP:
-        raise ValueError(f"group {group} != {GROUP}")
-    if k % GROUP != 0:
-        raise ValueError(f"K {k} is not a multiple of {GROUP}")
+    if group not in GROUPS:
+        raise ValueError(f"group {group} not in {GROUPS}")
+    if k % group != 0:
+        raise ValueError(f"K {k} is not a multiple of {group}")
     if x.ndim == 1:
         x = x.reshape(1, -1)
     if not isinstance(x, mx.array):
@@ -116,6 +115,34 @@ def _prepare(x, codes, scales, k, group):
     codes = mx.contiguous(codes)
     scales = mx.contiguous(scales)
     return x, codes, scales, int(x.shape[0]), int(codes.shape[0])
+
+
+# Kernel sources are written for group 64. Group 128 only changes how a
+# weight index maps to its scale: k >> 7 instead of k >> 6, and one more
+# lane bit per scale. Group 64 sources are left byte-identical.
+_REGROUP_128 = (
+    ("k >> 6", "k >> 7"),
+    ("t >> 6", "t >> 7"),
+    ("(lane >> 2)", "(lane >> 3)"),
+    ("(lane >> 4)", "(lane >> 5)"),
+    ("((k0 + wc) >> 6)", "((k0 + wc) >> 7)"),
+)
+
+
+def _regroup(source: str, group: int) -> str:
+    if group == 64:
+        return source
+    if group != 128:
+        raise ValueError(f"group {group} not in {GROUPS}")
+    for old, new in _REGROUP_128:
+        source = source.replace(old, new)
+    if ">> 6" in source:
+        raise AssertionError("group 128 source still indexes scales by 64")
+    return source
+
+
+def _gname(group: int) -> str:
+    return "" if group == 64 else f"_gs{group}"
 
 
 def _dot16_expr(w: str, vecdot: bool = False) -> str:
@@ -615,8 +642,8 @@ def run_qmv_mlx(x, codes, scales, k, rows: int = 4, nsg: int = 2, group: int = G
     guarded = (n % rows_per_tg) != 0
     tg = nsg * 32
     n_tiles = (n + rows_per_tg - 1) // rows_per_tg
-    name = f"mlxtern3_qmvmlx_r{rows}_s{nsg}" + ("_g" if guarded else "_a")
-    ker = metal(name, _qmv_mlx_source(nsg, rows, guarded))
+    name = f"mlxtern3_qmvmlx_r{rows}_s{nsg}" + ("_g" if guarded else "_a") + _gname(group)
+    ker = metal(name, _regroup(_qmv_mlx_source(nsg, rows, guarded), group))
     (y,) = ker(
         inputs=[x, codes, scales, meta_u32([n, k, k // 4, k // group, b])],
         template=[("T", mx.float32)],
@@ -628,8 +655,7 @@ def run_qmv_mlx(x, codes, scales, k, rows: int = 4, nsg: int = 2, group: int = G
     return y
 
 
-def run_qmv(x, codes, scales, k, rows: int = QMV_ROWS, nsg: int = QMV_NSG, vpt: int = 16, use_lut: bool = False, fast: bool = True, group: int = GROUP, vecdot: bool = False, specialize: bool = True, narrow: bool = False, half_dot: bool = False, chunk128: bool = False):
-    del vpt, use_lut
+def run_qmv(x, codes, scales, k, rows: int = QMV_ROWS, nsg: int = QMV_NSG, group: int = GROUP, vecdot: bool = False, specialize: bool = True, narrow: bool = False, half_dot: bool = False, chunk128: bool = False):
     x, codes, scales, b, n = _prepare(x, codes, scales, k, group)
     if rows not in (2, 4, 8) or nsg not in (1, 2, 4):
         raise ValueError(f"qmv rows={rows} nsg={nsg}")
@@ -650,9 +676,8 @@ def run_qmv(x, codes, scales, k, rows: int = QMV_ROWS, nsg: int = QMV_NSG, vpt: 
     if half_dot:
         name += "_h"
     name += "_g" if guarded else "_a"
-    if fast:
-        name += "_fast"
-    ker = metal(name, _qmv_source(nsg, rows, guarded, blocks, vecdot, narrow, half_dot, chunk128), fast=fast)
+    name += "_fast" + _gname(group)
+    ker = metal(name, _regroup(_qmv_source(nsg, rows, guarded, blocks, vecdot, narrow, half_dot, chunk128), group))
     (y,) = ker(
         inputs=[x, codes, scales, meta_u32([n, k, k // 4, k // group, b])],
         template=[("T", mx.float32)],
@@ -664,15 +689,14 @@ def run_qmv(x, codes, scales, k, rows: int = QMV_ROWS, nsg: int = QMV_NSG, vpt: 
     return y
 
 
-def run_gemm(x, codes, scales, k, bm: int = GEMM_BM, bn: int = GEMM_BN, bk: int = GEMM_BK, safe: bool | None = None, fast: bool = True, group: int = GROUP, transpose_b: bool = True, use_lut: bool = False, wide_w: bool | None = None, half_w: bool = True, acc_half: bool = False):
-    del safe, transpose_b, use_lut, wide_w, acc_half
+def run_gemm(x, codes, scales, k, bm: int = GEMM_BM, bn: int = GEMM_BN, bk: int = GEMM_BK, group: int = GROUP, half_w: bool = True):
     x, codes, scales, b, n = _prepare(x, codes, scales, k, group)
     if k % bk or n % bn or b % bm:
         raise ValueError(f"gemm tile {bm}x{bn}x{bk} does not cover N={n} K={k} B={b}")
     nsg = (bm // 16) * (bn // 16)
     tg = nsg * 32
-    name = f"mlxtern3_u2g2_{bm}x{bn}x{bk}" + ("" if half_w else "_fw") + ("_fast" if fast else "")
-    ker = metal(name, _gemm_source(bm, bn, bk, half_w), fast=fast)
+    name = f"mlxtern3_u2g2_{bm}x{bn}x{bk}" + ("" if half_w else "_fw") + "_fast" + _gname(group)
+    ker = metal(name, _regroup(_gemm_source(bm, bn, bk, half_w), group))
     (y,) = ker(
         inputs=[x, codes, scales, meta_u32([n, k, k // 4, k // group, b])],
         template=[("T", mx.float32)],
@@ -715,12 +739,30 @@ def _dispatch(x, codes, scales, k: int, group: int):
     if tile is not None:
         bm, bn, bk = tile
         return run_gemm(x, codes, scales, k, bm, bn, bk, group=group)
+    head = _gemm_head(b, n, k)
+    if head:
+        # Batch >= 32 but not a multiple of 32: the leading multiple of 32
+        # rows go through the GEMM, the remainder through the GEMV.
+        top = run_gemm(x[:head], codes, scales, k, GEMM_BM, GEMM_BN, GEMM_BK, group=group)
+        rest = _gemv(x[head:], codes, scales, k, group)
+        return mx.concatenate([top, rest], axis=0)
+    return _gemv(x, codes, scales, k, group)
+
+
+def _gemv(x, codes, scales, k: int, group: int):
     # K multiple of 512 uses the MLX qmv_fast walk (2 rows, 1 simdgroup).
     # Shorter K, including the 640-wide expert down projection, keeps the
     # 128-wide body, which is faster there.
     if k % 512 == 0:
         return run_qmv_mlx(x, codes, scales, k, rows=2, nsg=1, group=group)
     return run_qmv(x, codes, scales, k, group=group)
+
+
+def _gemm_head(b: int, n: int, k: int) -> int:
+    """Rows of a ragged batch that the GEMM can take; 0 if none."""
+    if b < GEMM_MIN_BATCH or n % 32 or k % 32:
+        return 0
+    return (b // 32) * 32
 
 
 def _gemm_launch(b: int, n: int, k: int) -> tuple[int, int, int] | None:
@@ -734,6 +776,8 @@ def _gemm_launch(b: int, n: int, k: int) -> tuple[int, int, int] | None:
 def tern_matmul(x, codes, scales, k: int, group: int = GROUP) -> mx.array:
     """x [B, K] or [K], codes uint8 [N, K/4], scales [N, K/group] -> [B, N].
 
+    ``group`` is 64 (default) or 128 weights per scale.
+
     Batches up to ``COMPILE_MAX_BATCH`` reuse a compiled graph from a bounded
     LRU keyed by shape and dtype; weights are arguments, not captured, so the
     cache never keeps them alive. Larger batches dispatch the kernel directly.
@@ -744,10 +788,11 @@ def tern_matmul(x, codes, scales, k: int, group: int = GROUP) -> mx.array:
     if x.ndim == 0 or x.ndim > 2:
         raise ValueError(f"x must have shape [K] or [B, K], got ndim {x.ndim}")
     k = int(k)
-    if group != GROUP:
-        raise ValueError(f"group {group} != {GROUP}")
-    if k <= 0 or k % GROUP:
-        raise ValueError(f"K {k} is not a positive multiple of {GROUP}")
+    group = int(group)
+    if group not in GROUPS:
+        raise ValueError(f"group {group} not in {GROUPS}")
+    if k <= 0 or k % group:
+        raise ValueError(f"K {k} is not a positive multiple of {group}")
     if int(x.shape[-1]) != k:
         raise ValueError(f"x last dim {x.shape[-1]} != K {k}")
     if codes.ndim != 2 or int(codes.shape[1]) != k // 4:

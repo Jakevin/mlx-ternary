@@ -12,7 +12,7 @@ from __future__ import annotations
 import mlx.core as mx
 import numpy as np
 
-from .pack import GROUP, pack_trits
+from .pack import GROUP, GROUPS, pack_trits
 
 _LANES = 16
 
@@ -45,16 +45,16 @@ def from_mlx_2bit(weight, scales, biases, group_size: int = GROUP):
     """Repack MLX affine 2-bit ternary weights.
 
     ``weight`` is uint32 ``[N, K/16]``. ``scales`` and ``biases`` are
-    ``[N, K/group_size]``. Codes must lie in ``{0, 1, 2}`` and ``biases``
+    ``[N, K/group_size]`` with ``group_size`` 64 (default) or 128. Codes must lie in ``{0, 1, 2}`` and ``biases``
     must equal ``-scales``. Returns uint8 codes ``[N, K/4]`` and float32 scales.
     """
-    if group_size != GROUP:
-        raise ValueError(f"group_size {group_size} != {GROUP}")
+    if group_size not in GROUPS:
+        raise ValueError(f"group_size {group_size} not in {GROUPS}")
     words = _as_numpy(weight, mx.uint32, np.uint32)
     scale_f = np.ascontiguousarray(_as_numpy(scales, mx.float32, np.float32), dtype=np.float32)
     bias_f = np.ascontiguousarray(_as_numpy(biases, mx.float32, np.float32), dtype=np.float32)
     if words.ndim != 2 or scale_f.ndim != 2:
-        raise ValueError("expected weight [N, K/16] and scales [N, K/64]")
+        raise ValueError("expected weight [N, K/16] and scales [N, K/group_size]")
     if bias_f.shape != scale_f.shape:
         raise ValueError(f"biases shape {bias_f.shape} != scales shape {scale_f.shape}")
     n, nwords = (int(v) for v in words.shape)

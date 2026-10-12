@@ -3,7 +3,8 @@
 """Ternary linear layers for MLX.
 
 Ternary carries about 1.85 bits of information per weight; it is stored
-in 2-bit slots, so the resident size is 2.25 bits, the same as MLX 2-bit.
+in 2-bit slots, so the resident size is 2.25 bits at group 64, the same as MLX 2-bit,
+or 2.125 bits with the group 128 option.
 """
 
 from mlx_ternary.convert import from_mlx_2bit, unpack_mlx_2bit
@@ -11,6 +12,7 @@ from mlx_ternary.kernel import configure, set_cache_limit, tern_matmul
 from mlx_ternary.linear import TernaryLinear, replace_quantized_linears
 from mlx_ternary.pack import (
     GROUP,
+    GROUPS,
     dequantize,
     info_bits_per_weight,
     pack_trits,
@@ -22,6 +24,7 @@ __version__ = "0.3.0"
 
 __all__ = [
     "GROUP",
+    "GROUPS",
     "TernaryLinear",
     "configure",
     "dequantize",
