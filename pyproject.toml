@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mlx-ternary"
 version = "0.3.0"
-description = "Ternary linear layers for MLX, about 1.85 bits per weight"
+description = "Ternary linear layers for MLX (2.25 bits per weight resident, same as MLX 2-bit)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }

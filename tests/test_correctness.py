@@ -106,3 +106,32 @@ def test_rejects_bad_shapes():
         tern_matmul(mx.ones((2, 3, 64)), codes, scale_mx, 64)
     with pytest.raises(ValueError):
         tern_matmul(mx.ones((1, 32)), codes, scale_mx, 32)
+
+
+def _case(n, k, b, seed=7):
+    rng = np.random.default_rng(seed)
+    trits = rng.integers(-1, 2, size=(n, k), dtype=np.int8)
+    scales = rng.uniform(0.05, 0.3, size=(n, k // 64)).astype(np.float32)
+    packed, _ = pack_trits(trits)
+    x = rng.standard_normal((b, k)).astype(np.float32)
+    return x, packed, scales, x @ dequantize(trits, scales).T
+
+
+@pytest.mark.parametrize("b", [1, 32])
+def test_non_contiguous_x(b):
+    x, packed, scales, ref = _case(64, 512, b)
+    xt = mx.array(np.ascontiguousarray(x.T)).T  # transposed view
+    y = np.array(tern_matmul(xt, mx.array(packed), mx.array(scales), 512))
+    assert np.abs(y - ref).max() / np.abs(ref).max() < 1e-3
+
+
+def test_shape_mismatch_raises():
+    with pytest.raises(ValueError):
+        tern_matmul(mx.zeros((1, 128)), mx.zeros((4, 16), dtype=mx.uint8), mx.zeros((4, 2)), 128)
+    with pytest.raises(ValueError):
+        tern_matmul(mx.zeros((1, 128)), mx.zeros((4, 32), dtype=mx.uint8), mx.zeros((4, 3)), 128)
+
+
+def test_empty_batch():
+    y = tern_matmul(mx.zeros((0, 128)), mx.zeros((4, 32), dtype=mx.uint8), mx.ones((4, 2)), 128)
+    assert tuple(y.shape) == (0, 4)

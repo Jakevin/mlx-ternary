@@ -1,6 +1,6 @@
 # mlx_ternary
 
-Apple M4 Pro. Times are interleaved medians in milliseconds. The ratio is v3 divided by MLX 2-bit f32 (`mx.quantized_matmul`, bits=2, group 64) on the same weight. Ternary weights are about 1.85 bits. Kernel error against the dequantized ternary matrix stays under 1e-3.
+Apple M4 Pro. Times are interleaved medians in milliseconds. The ratio is v3 divided by MLX 2-bit f32 (`mx.quantized_matmul`, bits=2, group 64) on the same weight. Ternary weights carry about 1.85 bits of information but are stored at 2.25 bits per weight, the same as MLX 2-bit (see below). Kernel error against the dequantized ternary matrix stays under 1e-3.
 
 | Mode | Matrix | v3 (ms) | MLX 2-bit f32 (ms) | MLX 4-bit (ms) | v3 / MLX 2-bit |
 | --- | --- | ---: | ---: | ---: | ---: |
@@ -24,7 +24,7 @@ A ternary value carries log2(3) ≈ 1.585 bits, plus one 16-bit scale for every 
 
 Ternary currently occupies 2.25 bits per weight resident, the same as MLX 2-bit. The point is an extra supported format with no speed loss, not smaller files.
 
-The reference is the dequantized ternary matrix, `max|y − ref| / max|ref|`. The bound is 1e-3. The largest probed case was 1.44e-6 (64×6144, batch 32). Errors on the timed shapes were at most 4e-7.
+The reference is the dequantized ternary matrix, `max|y − ref| / max|ref|`. The bound is 1e-3. The largest probed case was 1.44e-6 (64×6144, batch 32). Errors on the timed shapes were at most 4e-7. Those probes used scales that are exact in half precision. The batch ≥ 32 GEMM stages dequantized weights as half, so with arbitrary float32 scales its error is set by half rounding of `scale` (seen up to about 3e-4, still under 1e-3); the GEMV path stays near 1e-7.
 
 ## Load a layer
 
@@ -103,6 +103,7 @@ MLX affine 2-bit stores the same codes, 16 per uint32, lane `i` in bits `[2i, 2i
 * Apple Silicon, through MLX Metal.
 * Group size is 64. `K` is a multiple of 64. There is no per-group zero point.
 * The layer returns the dtype of `x`. The kernel accumulates in float32.
+* Inputs may be non-contiguous views; they are copied to row-major first. An empty batch returns an empty result without a kernel launch. `tern_matmul` checks that `codes` is `[N, K/4]` and `scales` is `[N, K/64]`.
 * Parameters are frozen. This package does not choose scales or codes.
 * `from_quantized_linear` accepts an affine 2-bit `QuantizedLinear` whose codes are in {0, 1, 2} and whose per-group bias equals `-scale`. Other bit widths and other biases raise `ValueError`.
 * The 1e-3 figure is the kernel's error against the packed ternary matrix.

@@ -108,6 +108,11 @@ def _prepare(x, codes, scales, k, group):
         scales = mx.array(scales)
     if int(x.shape[-1]) != k:
         raise ValueError(f"x last dim {x.shape[-1]} != K {k}")
+    # The kernels index raw row-major buffers (ensure_row_contiguous=False),
+    # so transposed or sliced views must be copied first. No-op if contiguous.
+    x = mx.contiguous(x)
+    codes = mx.contiguous(codes)
+    scales = mx.contiguous(scales)
     return x, codes, scales, int(x.shape[0]), int(codes.shape[0])
 
 
@@ -714,12 +719,22 @@ def tern_matmul(x, codes, scales, k: int, group: int = GROUP) -> mx.array:
         x = mx.array(x)
     if x.ndim == 0 or x.ndim > 2:
         raise ValueError(f"x must have shape [K] or [B, K], got ndim {x.ndim}")
-    if x.ndim == 1:
-        b = 1
-        n = int(codes.shape[0])
-    else:
-        b = int(x.shape[0])
-        n = int(codes.shape[0])
+    k = int(k)
+    if group != GROUP:
+        raise ValueError(f"group {group} != {GROUP}")
+    if k <= 0 or k % GROUP:
+        raise ValueError(f"K {k} is not a positive multiple of {GROUP}")
+    if int(x.shape[-1]) != k:
+        raise ValueError(f"x last dim {x.shape[-1]} != K {k}")
+    if codes.ndim != 2 or int(codes.shape[1]) != k // 4:
+        raise ValueError(f"codes shape {tuple(codes.shape)} != [N, K/4] with K={k}")
+    n = int(codes.shape[0])
+    if tuple(scales.shape) != (n, k // group):
+        raise ValueError(f"scales shape {tuple(scales.shape)} != ({n}, {k // group})")
+    b = 1 if x.ndim == 1 else int(x.shape[0])
+    if b == 0 or n == 0:
+        # An empty launch would hand Metal a zero-size buffer.
+        return mx.zeros((b, n), dtype=mx.float32)
     key = (id(codes), id(scales), int(k), b, n, int(group))
     fn = _COMPILED.get(key)
     if fn is None:

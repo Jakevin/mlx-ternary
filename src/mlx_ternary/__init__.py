@@ -1,6 +1,10 @@
 # Copyright 2026 Jakevin
 # SPDX-License-Identifier: Apache-2.0
-"""Ternary linear layers for MLX, about 1.85 bits per weight."""
+"""Ternary linear layers for MLX.
+
+Ternary carries about 1.85 bits of information per weight; it is stored
+in 2-bit slots, so the resident size is 2.25 bits, the same as MLX 2-bit.
+"""
 
 from mlx_ternary.convert import from_mlx_2bit, unpack_mlx_2bit
 from mlx_ternary.kernel import configure, set_cache_limit, tern_matmul
